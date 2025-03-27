@@ -4,8 +4,10 @@ import json
 from typing import TypeVar, Type, Optional, Any
 from pydantic import BaseModel
 from utils.progress import progress
+import threading
 
 T = TypeVar('T', bound=BaseModel)
+llm_lock = threading.Lock()
 
 def call_llm(
     prompt: Any,
@@ -47,7 +49,8 @@ def call_llm(
     for attempt in range(max_retries):
         try:
             # Call the LLM
-            result = llm.invoke(prompt)
+            with llm_lock:
+                result = llm.invoke(prompt)
             
             # For non-JSON support models, we need to extract and parse the JSON manually
             if model_info and not model_info.has_json_mode():
