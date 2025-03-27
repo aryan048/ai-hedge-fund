@@ -4,6 +4,7 @@ from langchain_deepseek import ChatDeepSeek
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_groq import ChatGroq
 from langchain_openai import ChatOpenAI
+from langchain_ollama import ChatOllama
 from enum import Enum
 from pydantic import BaseModel
 from typing import Tuple
@@ -107,7 +108,7 @@ AVAILABLE_MODELS = [
     ),
     LLMModel(
         display_name="[local] ollama",
-        model_name="ollama",
+        model_name="llama3.2",
         provider = ModelProvider.LOCAL
     )
 ]
@@ -153,4 +154,5 @@ def get_model(model_name: str, model_provider: ModelProvider) -> ChatOpenAI | Ch
             print(f"API Key Error: Please make sure GOOGLE_API_KEY is set in your .env file.")
             raise ValueError("Google API key not found.  Please make sure GOOGLE_API_KEY is set in your .env file.")
         return ChatGoogleGenerativeAI(model=model_name, api_key=api_key)    
-    elif model_provider == ModelProvider.LOCAL:    
+    elif model_provider == ModelProvider.LOCAL:
+        return ChatOllama(model=model_name, api_key=None)
