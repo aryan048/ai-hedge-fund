@@ -139,7 +139,7 @@ def phil_fisher_agent(state: AgentState):
             "sentiment_analysis": sentiment_analysis,
         }
 
-        progress.update_status("phil_fisher_agent", ticker, "Generating Phil Fisher-style analysis")
+        progress.update_status("phil_fisher_agent", ticker, "Generating Phil Fisher analysis")
         fisher_output = generate_fisher_output(
             ticker=ticker,
             analysis_data=analysis_data,
