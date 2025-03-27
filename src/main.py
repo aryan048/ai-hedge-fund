@@ -26,6 +26,9 @@ from dateutil.relativedelta import relativedelta
 from tabulate import tabulate
 from utils.visualize import save_graph_as_png
 import json
+import smtplib
+from email.message import EmailMessage
+import os
 
 # Load environment variables from .env file
 load_dotenv()
@@ -286,3 +289,13 @@ if __name__ == "__main__":
         model_provider=model_provider,
     )
     print_trading_output(result)
+
+    msg = EmailMessage()
+    msg.set_content("Hello! This is a test text from Python.")
+    msg["Subject"] = "SMS Notification"
+    msg["From"] = os.getenv("YOUR_EMAIL")
+    msg["To"] = os.getenv("TO_PHONE_NUMBER")
+
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+        server.login(os.getenv("YOUR_EMAIL"), os.getenv("YOUR_PASSWORD"))
+        server.send_message(msg)
