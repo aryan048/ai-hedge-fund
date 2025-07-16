@@ -236,54 +236,91 @@ def print_backtest_results(table_rows: list) -> None:
     summary_rows = []
 
     for row in table_rows:
-        if isinstance(row[1], str) and "PORTFOLIO SUMMARY" in row[1]:
+        if isinstance(row[1], str) and ("PORTFOLIO SUMMARY" in row[1] or "ALPHA SUMMARY" in row[1]):
             summary_rows.append(row)
         else:
             ticker_rows.append(row)
 
     
-    # Display latest portfolio summary
+    # Display latest summary (either portfolio or alpha)
     if summary_rows:
         latest_summary = summary_rows[-1]
-        print(f"\n{Fore.WHITE}{Style.BRIGHT}PORTFOLIO SUMMARY:{Style.RESET_ALL}")
-
-        # Extract values and remove commas before converting to float
-        cash_str = latest_summary[7].split("$")[1].split(Style.RESET_ALL)[0].replace(",", "")
-        position_str = latest_summary[6].split("$")[1].split(Style.RESET_ALL)[0].replace(",", "")
-        total_str = latest_summary[8].split("$")[1].split(Style.RESET_ALL)[0].replace(",", "")
-
-        print(f"Cash Balance: {Fore.CYAN}${float(cash_str):,.2f}{Style.RESET_ALL}")
-        print(f"Total Position Value: {Fore.YELLOW}${float(position_str):,.2f}{Style.RESET_ALL}")
-        print(f"Total Value: {Fore.WHITE}${float(total_str):,.2f}{Style.RESET_ALL}")
-        print(f"Return: {latest_summary[9]}")
         
-        # Display performance metrics if available
-        if latest_summary[10]:  # Sharpe ratio
-            print(f"Sharpe Ratio: {latest_summary[10]}")
-        if latest_summary[11]:  # Sortino ratio
-            print(f"Sortino Ratio: {latest_summary[11]}")
-        if latest_summary[12]:  # Max drawdown
-            print(f"Max Drawdown: {latest_summary[12]}")
+        # Check if this is an alpha summary or traditional portfolio summary
+        if "ALPHA SUMMARY" in str(latest_summary[1]):
+            print(f"\n{Fore.WHITE}{Style.BRIGHT}ALPHA PERFORMANCE SUMMARY:{Style.RESET_ALL}")
+            
+            # Alpha summary format: [date, "ALPHA SUMMARY", "", "", "", "", "", win_rate, avg_alpha, alpha_sharpe]
+            if len(latest_summary) >= 10:
+                # Check if this is showing actual metrics or waiting status
+                if "No trades yet" in str(latest_summary[7]):
+                    print(f"{latest_summary[7]}")  # No trades message
+                    print(f"Status: {latest_summary[8]}")  # Awaiting trades message
+                else:
+                    print(f"Win Rate: {latest_summary[7]}")
+                    print(f"Average Alpha: {latest_summary[8]}")
+                    print(f"Alpha Sharpe: {latest_summary[9]}")
+            
+        else:
+            # Traditional portfolio summary
+            print(f"\n{Fore.WHITE}{Style.BRIGHT}PORTFOLIO SUMMARY:{Style.RESET_ALL}")
+
+            # Extract values and remove commas before converting to float
+            if len(latest_summary) >= 13:
+                cash_str = latest_summary[7].split("$")[1].split(Style.RESET_ALL)[0].replace(",", "")
+                position_str = latest_summary[6].split("$")[1].split(Style.RESET_ALL)[0].replace(",", "")
+                total_str = latest_summary[8].split("$")[1].split(Style.RESET_ALL)[0].replace(",", "")
+
+                print(f"Cash Balance: {Fore.CYAN}${float(cash_str):,.2f}{Style.RESET_ALL}")
+                print(f"Total Position Value: {Fore.YELLOW}${float(position_str):,.2f}{Style.RESET_ALL}")
+                print(f"Total Value: {Fore.WHITE}${float(total_str):,.2f}{Style.RESET_ALL}")
+                print(f"Return: {latest_summary[9]}")
+                
+                # Display performance metrics if available
+                if latest_summary[10]:  # Sharpe ratio
+                    print(f"Sharpe Ratio: {latest_summary[10]}")
+                if latest_summary[11]:  # Sortino ratio
+                    print(f"Sortino Ratio: {latest_summary[11]}")
+                if latest_summary[12]:  # Max drawdown
+                    print(f"Max Drawdown: {latest_summary[12]}")
 
     # Add vertical spacing
     print("\n" * 2)
 
-    # Print the table with just ticker rows
+    # Print the table with just ticker rows - use appropriate headers based on summary type
+    if summary_rows and "ALPHA SUMMARY" in str(summary_rows[-1][1]):
+        # Alpha-focused headers
+        headers = [
+            "Date",
+            "Ticker", 
+            "Action",
+            "Quantity",
+            "Price",
+            "Shares",
+            "Trade Cost",
+            "Bullish",
+            "Bearish", 
+            "Neutral",
+        ]
+    else:
+        # Traditional headers
+        headers = [
+            "Date",
+            "Ticker",
+            "Action", 
+            "Quantity",
+            "Price",
+            "Shares",
+            "Position Value",
+            "Bullish",
+            "Bearish",
+            "Neutral",
+        ]
+
     print(
         tabulate(
             ticker_rows,
-            headers=[
-                "Date",
-                "Ticker",
-                "Action",
-                "Quantity",
-                "Price",
-                "Shares",
-                "Position Value",
-                "Bullish",
-                "Bearish",
-                "Neutral",
-            ],
+            headers=headers,
             tablefmt="grid",
             colalign=(
                 "left",  # Date
@@ -292,7 +329,7 @@ def print_backtest_results(table_rows: list) -> None:
                 "right",  # Quantity
                 "right",  # Price
                 "right",  # Shares
-                "right",  # Position Value
+                "right",  # Position/Trade Value
                 "right",  # Bullish
                 "right",  # Bearish
                 "right",  # Neutral
@@ -316,14 +353,14 @@ def format_backtest_row(
     bearish_count: int,
     neutral_count: int,
     is_summary: bool = False,
-    total_value: float = None,
-    return_pct: float = None,
-    cash_balance: float = None,
-    total_position_value: float = None,
-    sharpe_ratio: float = None,
-    sortino_ratio: float = None,
-    max_drawdown: float = None,
-) -> list[any]:
+    total_value: float | None = None,
+    return_pct: float | None = None,
+    cash_balance: float | None = None,
+    total_position_value: float | None = None,
+    sharpe_ratio: float | None = None,
+    sortino_ratio: float | None = None,
+    max_drawdown: float | None = None,
+) -> list:
     """Format a row for the backtest results table"""
     # Color the action
     action_color = {
@@ -335,7 +372,7 @@ def format_backtest_row(
     }.get(action.upper(), Fore.WHITE)
 
     if is_summary:
-        return_color = Fore.GREEN if return_pct >= 0 else Fore.RED
+        return_color = Fore.GREEN if return_pct is not None and return_pct >= 0 else Fore.RED
         return [
             date,
             f"{Fore.WHITE}{Style.BRIGHT}PORTFOLIO SUMMARY{Style.RESET_ALL}",

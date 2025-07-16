@@ -3,6 +3,16 @@ import os
 import pandas as pd
 import requests
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+from functools import wraps
+
+try:
+    import yfinance as yf
+    YFINANCE_AVAILABLE = True
+except ImportError:
+    YFINANCE_AVAILABLE = False
+    print("Warning: yfinance not installed. SPY benchmark functionality will be limited.")
 
 from src.data.cache import get_cache
 from src.data.models import (
@@ -23,7 +33,31 @@ from src.data.models import (
 _cache = get_cache()
 
 
-def _make_api_request(url: str, headers: dict, method: str = "GET", json_data: dict = None, max_retries: int = 3) -> requests.Response:
+class TimeoutError(Exception):
+    """Custom timeout exception."""
+    pass
+
+
+def with_timeout(timeout_seconds=30):
+    """Thread-safe decorator to add timeout to functions."""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            def target():
+                return func(*args, **kwargs)
+            
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(target)
+                try:
+                    return future.result(timeout=timeout_seconds)
+                except FuturesTimeoutError:
+                    print(f"Function {func.__name__} timed out after {timeout_seconds} seconds")
+                    raise TimeoutError(f"Function {func.__name__} timed out after {timeout_seconds} seconds")
+        return wrapper
+    return decorator
+
+
+def _make_api_request(url: str, headers: dict, method: str = "GET", json_data: dict | None = None, max_retries: int = 3) -> requests.Response:
     """
     Make an API request with rate limiting handling and moderate backoff.
     
@@ -41,20 +75,36 @@ def _make_api_request(url: str, headers: dict, method: str = "GET", json_data: d
         Exception: If the request fails with a non-429 error
     """
     for attempt in range(max_retries + 1):  # +1 for initial attempt
-        if method.upper() == "POST":
-            response = requests.post(url, headers=headers, json=json_data)
-        else:
-            response = requests.get(url, headers=headers)
-        
-        if response.status_code == 429 and attempt < max_retries:
-            # Linear backoff: 60s, 90s, 120s, 150s...
-            delay = 60 + (30 * attempt)
-            print(f"Rate limited (429). Attempt {attempt + 1}/{max_retries + 1}. Waiting {delay}s before retrying...")
-            time.sleep(delay)
+        try:
+            if method.upper() == "POST":
+                response = requests.post(url, headers=headers, json=json_data, timeout=30)
+            else:
+                response = requests.get(url, headers=headers, timeout=30)
+            
+            if response.status_code == 429 and attempt < max_retries:
+                # Reduced backoff times: 30s, 45s, 60s instead of 60s, 90s, 120s
+                delay = 30 + (15 * attempt)
+                print(f"Rate limited (429). Attempt {attempt + 1}/{max_retries + 1}. Waiting {delay}s before retrying...")
+                time.sleep(delay)
+                continue
+            
+            # Return the response (whether success, other errors, or final 429)
+            return response
+            
+        except requests.exceptions.Timeout:
+            print(f"Request timeout on attempt {attempt + 1}/{max_retries + 1}")
+            if attempt == max_retries:
+                raise Exception(f"Request timed out after {max_retries + 1} attempts")
+            time.sleep(5)  # Short wait before retrying timeout
             continue
-        
-        # Return the response (whether success, other errors, or final 429)
-        return response
+        except requests.exceptions.RequestException as e:
+            if attempt == max_retries:
+                raise Exception(f"Request failed after {max_retries + 1} attempts: {e}")
+            time.sleep(5)
+            continue
+    
+    # This line should never be reached due to the raise statements above, but adding for completeness
+    raise Exception("Unexpected error: no response returned from API request")
 
 
 def get_prices(ticker: str, start_date: str, end_date: str) -> list[Price]:
@@ -219,13 +269,15 @@ def get_insider_trades(
     return all_trades
 
 
+@with_timeout(timeout_seconds=120)  # 2-minute overall timeout for news fetching
 def get_company_news(
     ticker: str,
     end_date: str,
     start_date: str | None = None,
     limit: int = 1000,
+    max_pages: int = 10,  # Maximum number of API calls to prevent infinite loops
 ) -> list[CompanyNews]:
-    """Fetch company news from cache or API."""
+    """Fetch company news from cache or API with timeout and pagination safety."""
     # Create a cache key that includes all parameters to ensure exact matches
     cache_key = f"{ticker}_{start_date or 'none'}_{end_date}_{limit}"
     
@@ -240,43 +292,97 @@ def get_company_news(
 
     all_news = []
     current_end_date = end_date
+    page_count = 0
+    seen_dates = set()  # Track dates to prevent infinite loops
+    
+    print(f"Fetching news for {ticker} from {start_date} to {end_date} (limit: {limit})")
 
-    while True:
-        url = f"https://api.financialdatasets.ai/news/?ticker={ticker}&end_date={current_end_date}"
-        if start_date:
-            url += f"&start_date={start_date}"
-        url += f"&limit={limit}"
+    while page_count < max_pages:
+        page_count += 1
+        
+        try:
+            url = f"https://api.financialdatasets.ai/news/?ticker={ticker}&end_date={current_end_date}"
+            if start_date:
+                url += f"&start_date={start_date}"
+            url += f"&limit={min(limit, 1000)}"  # API may have its own limits
 
-        response = _make_api_request(url, headers)
-        if response.status_code != 200:
-            raise Exception(f"Error fetching data: {ticker} - {response.status_code} - {response.text}")
+            print(f"Fetching news page {page_count} for {ticker} (end_date: {current_end_date})")
+            
+            response = _make_api_request(url, headers)
+            if response.status_code != 200:
+                print(f"API error for {ticker}: {response.status_code} - {response.text[:200]}...")
+                # Don't raise exception immediately, try to return what we have
+                break
 
-        data = response.json()
-        response_model = CompanyNewsResponse(**data)
-        company_news = response_model.news
+            data = response.json()
+            response_model = CompanyNewsResponse(**data)
+            company_news = response_model.news
 
-        if not company_news:
+            if not company_news:
+                print(f"No more news found for {ticker} on page {page_count}")
+                break
+
+            # Check if we're seeing the same dates repeatedly (infinite loop detection)
+            news_dates = [news.date.split("T")[0] for news in company_news]
+            current_batch_dates = set(news_dates)
+            
+            if current_batch_dates.issubset(seen_dates):
+                print(f"Detected potential infinite loop for {ticker} - same dates returned. Stopping pagination.")
+                break
+                
+            seen_dates.update(current_batch_dates)
+            all_news.extend(company_news)
+
+            # Early exit if we have enough news
+            if len(all_news) >= limit:
+                print(f"Reached limit of {limit} news items for {ticker}")
+                break
+
+            # Only continue pagination if we have a start_date and got a full page
+            if not start_date or len(company_news) < min(limit, 1000):
+                print(f"Pagination complete for {ticker} - partial page received")
+                break
+
+            # Update end_date to the oldest date from current batch for next iteration
+            try:
+                oldest_date = min(news.date for news in company_news).split("T")[0]
+                
+                # Safety check: ensure we're actually moving backward in time
+                if oldest_date >= current_end_date:
+                    print(f"Date not advancing for {ticker} (current: {current_end_date}, oldest: {oldest_date}). Stopping pagination.")
+                    break
+                    
+                current_end_date = oldest_date
+                
+                # If we've reached or passed the start_date, we can stop
+                if start_date and current_end_date <= start_date:
+                    print(f"Reached start date for {ticker}. Stopping pagination.")
+                    break
+                    
+            except (ValueError, AttributeError) as e:
+                print(f"Error processing dates for {ticker}: {e}. Stopping pagination.")
+                break
+
+        except Exception as e:
+            print(f"Error fetching news page {page_count} for {ticker}: {e}")
+            # Don't fail completely, return what we have so far
             break
 
-        all_news.extend(company_news)
-
-        # Only continue pagination if we have a start_date and got a full page
-        if not start_date or len(company_news) < limit:
-            break
-
-        # Update end_date to the oldest date from current batch for next iteration
-        current_end_date = min(news.date for news in company_news).split("T")[0]
-
-        # If we've reached or passed the start_date, we can stop
-        if current_end_date <= start_date:
-            break
+    print(f"Completed news fetch for {ticker}: {len(all_news)} articles across {page_count} pages")
 
     if not all_news:
         return []
 
+    # Limit results to the requested amount
+    limited_news = all_news[:limit] if len(all_news) > limit else all_news
+
     # Cache the results using the comprehensive cache key
-    _cache.set_company_news(cache_key, [news.model_dump() for news in all_news])
-    return all_news
+    try:
+        _cache.set_company_news(cache_key, [news.model_dump() for news in limited_news])
+    except Exception as e:
+        print(f"Warning: Failed to cache news for {ticker}: {e}")
+
+    return limited_news
 
 
 def get_market_cap(
@@ -329,3 +435,97 @@ def prices_to_df(prices: list[Price]) -> pd.DataFrame:
 def get_price_data(ticker: str, start_date: str, end_date: str) -> pd.DataFrame:
     prices = get_prices(ticker, start_date, end_date)
     return prices_to_df(prices)
+
+
+def get_spy_data(start_date: str, end_date: str) -> pd.DataFrame:
+    """
+    Fetch SPY benchmark data using yfinance.
+    
+    Args:
+        start_date: Start date in YYYY-MM-DD format
+        end_date: End date in YYYY-MM-DD format
+        
+    Returns:
+        DataFrame with SPY price data including Date index and Close column
+    """
+    if not YFINANCE_AVAILABLE:
+        print("yfinance not available - cannot fetch SPY data")
+        return pd.DataFrame()
+        
+    try:
+        # Add buffer days to ensure we have data
+        start_dt = pd.to_datetime(start_date) - pd.Timedelta(days=5)
+        end_dt = pd.to_datetime(end_date) + pd.Timedelta(days=5)
+        
+        # Ensure we have valid datetime objects
+        if pd.isna(start_dt) or pd.isna(end_dt):
+            raise Exception(f"Invalid date format: start_date={start_date}, end_date={end_date}")
+        
+        spy = yf.Ticker("SPY")
+        spy_data = spy.history(
+            start=start_dt.strftime("%Y-%m-%d"), 
+            end=end_dt.strftime("%Y-%m-%d"),
+            auto_adjust=True,
+            back_adjust=True
+        )
+        
+        if spy_data.empty:
+            raise Exception(f"No SPY data available for period {start_date} to {end_date}")
+        
+        # Clean and format the data
+        spy_data = spy_data.reset_index()
+        spy_data['Date'] = pd.to_datetime(spy_data['Date']).dt.date
+        spy_data = spy_data[['Date', 'Close']].rename(columns={'Close': 'spy_close'})
+        spy_data = spy_data.set_index('Date')
+        
+        # Filter to requested date range
+        start_date_obj = pd.to_datetime(start_date).date()
+        end_date_obj = pd.to_datetime(end_date).date()
+        spy_data = spy_data[
+            (spy_data.index >= start_date_obj) & 
+            (spy_data.index <= end_date_obj)
+        ]
+        
+        return spy_data
+        
+    except Exception as e:
+        print(f"Error fetching SPY data: {e}")
+        return pd.DataFrame()
+
+
+def calculate_spy_return(spy_data: pd.DataFrame, start_date: str, end_date: str) -> float:
+    """
+    Calculate SPY return between two dates.
+    
+    Args:
+        spy_data: DataFrame with SPY price data
+        start_date: Start date in YYYY-MM-DD format  
+        end_date: End date in YYYY-MM-DD format
+        
+    Returns:
+        SPY return as decimal (e.g., 0.05 for 5% return)
+    """
+    try:
+        start_date_obj = pd.to_datetime(start_date).date()
+        end_date_obj = pd.to_datetime(end_date).date()
+        
+        # Find closest available dates
+        available_dates = spy_data.index
+        
+        # Get start price (closest date on or after start_date)
+        start_dates = available_dates[available_dates >= start_date_obj]
+        if len(start_dates) == 0:
+            return 0.0
+        start_price = spy_data.loc[start_dates[0], 'spy_close']
+        
+        # Get end price (closest date on or before end_date)
+        end_dates = available_dates[available_dates <= end_date_obj]
+        if len(end_dates) == 0:
+            return 0.0
+        end_price = spy_data.loc[end_dates[-1], 'spy_close']
+        
+        return (end_price - start_price) / start_price
+        
+    except Exception as e:
+        print(f"Error calculating SPY return: {e}")
+        return 0.0

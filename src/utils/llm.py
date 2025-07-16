@@ -1,6 +1,9 @@
 """Helper functions for LLM"""
 
 import json
+import time
+import re
+from typing import Any
 from pydantic import BaseModel
 from src.llm.models import get_model, get_model_info
 from src.utils.progress import progress
@@ -8,7 +11,7 @@ from src.graph.state import AgentState
 
 
 def call_llm(
-    prompt: any,
+    prompt: Any,
     pydantic_model: type[BaseModel],
     agent_name: str | None = None,
     state: AgentState | None = None,
@@ -17,6 +20,7 @@ def call_llm(
 ) -> BaseModel:
     """
     Makes an LLM call with retry logic, handling both JSON supported and non-JSON supported models.
+    Now includes OpenAI rate limiting support with 60-second wait when rate limits are encountered.
 
     Args:
         prompt: The prompt to send to the LLM
@@ -42,6 +46,13 @@ def call_llm(
 
     model_info = get_model_info(model_name, model_provider)
     llm = get_model(model_name, model_provider)
+    
+    # Ensure we have a valid LLM instance
+    if llm is None:
+        print(f"Failed to create LLM instance for {model_name} with provider {model_provider}")
+        if default_factory:
+            return default_factory()
+        return create_default_response(pydantic_model)
 
     # For non-JSON support models, we can use structured output
     if not (model_info and not model_info.has_json_mode()):
@@ -58,13 +69,49 @@ def call_llm(
 
             # For non-JSON support models, we need to extract and parse the JSON manually
             if model_info and not model_info.has_json_mode():
-                parsed_result = extract_json_from_response(result.content)
+                # Handle different result types
+                content = ""
+                try:
+                    # Try to get content attribute
+                    content = str(getattr(result, 'content', result))
+                except:
+                    content = str(result)
+                    
+                parsed_result = extract_json_from_response(content)
                 if parsed_result:
                     return pydantic_model(**parsed_result)
             else:
-                return result
+                # For structured output, result should already be a BaseModel
+                if isinstance(result, BaseModel):
+                    return result
+                else:
+                    # If it's not a BaseModel, try to construct one
+                    if isinstance(result, dict):
+                        return pydantic_model(**result)
+                    return result
 
         except Exception as e:
+            # Check if this is an OpenAI rate limit error
+            if _is_rate_limit_error(e):
+                wait_time = 60  # Always wait 60 seconds for rate limits
+                
+                if agent_name:
+                    progress.update_status(agent_name, None, f"Rate limited - waiting {wait_time}s before retry {attempt + 1}/{max_retries}")
+                
+                print(f"OpenAI rate limit reached. Waiting {wait_time} seconds before retry {attempt + 1}/{max_retries}...")
+                time.sleep(wait_time)
+                
+                # If this was the last attempt, still follow normal error handling
+                if attempt == max_retries - 1:
+                    print(f"Error in LLM call after {max_retries} attempts (final attempt was rate limited): {e}")
+                    if default_factory:
+                        return default_factory()
+                    return create_default_response(pydantic_model)
+                
+                # Continue to next retry attempt
+                continue
+            
+            # Handle other types of errors with normal retry logic
             if agent_name:
                 progress.update_status(agent_name, None, f"Error - retry {attempt + 1}/{max_retries}")
 
@@ -89,11 +136,11 @@ def create_default_response(model_class: type[BaseModel]) -> BaseModel:
             default_values[field_name] = 0.0
         elif field.annotation == int:
             default_values[field_name] = 0
-        elif hasattr(field.annotation, "__origin__") and field.annotation.__origin__ == dict:
+        elif field.annotation and hasattr(field.annotation, "__origin__") and field.annotation.__origin__ == dict:
             default_values[field_name] = {}
         else:
             # For other types (like Literal), try to use the first allowed value
-            if hasattr(field.annotation, "__args__"):
+            if field.annotation and hasattr(field.annotation, "__args__"):
                 default_values[field_name] = field.annotation.__args__[0]
             else:
                 default_values[field_name] = None
@@ -113,6 +160,80 @@ def extract_json_from_response(content: str) -> dict | None:
                 return json.loads(json_text)
     except Exception as e:
         print(f"Error extracting JSON from response: {e}")
+    return None
+
+
+def _is_rate_limit_error(exception: Exception) -> bool:
+    """
+    Detect if an exception is related to OpenAI rate limiting.
+    
+    Args:
+        exception: The exception to check
+        
+    Returns:
+        bool: True if this is a rate limiting error
+    """
+    exception_str = str(exception).lower()
+    
+    # Check for specific OpenAI rate limit error types
+    try:
+        # Try to import and check for specific OpenAI exception types
+        from openai import RateLimitError
+        if isinstance(exception, RateLimitError):
+            return True
+    except (ImportError, AttributeError):
+        # OpenAI library might not be available or different version
+        try:
+            # Try older import path
+            from openai.error import RateLimitError
+            if isinstance(exception, RateLimitError):
+                return True
+        except (ImportError, AttributeError):
+            # OpenAI library might not be available or different version
+            pass
+    
+    # Check for common rate limit error patterns in the error message
+    rate_limit_indicators = [
+        "rate limit",
+        "rate_limit_exceeded",
+        "too many requests",
+        "429",
+        "quota exceeded",
+        "requests per minute",
+        "tokens per minute",
+        "please try again in"
+    ]
+    
+    return any(indicator in exception_str for indicator in rate_limit_indicators)
+
+
+def _extract_retry_after_time(error_message: str) -> int | None:
+    """
+    Extract the retry-after time from OpenAI error messages.
+    
+    Args:
+        error_message: The error message from OpenAI
+        
+    Returns:
+        int: Number of seconds to wait, or None if not found
+    """
+    # Look for patterns like "Please try again in 1.232s" or "try again in 60s"
+    patterns = [
+        r"try again in (\d+(?:\.\d+)?)s",
+        r"please try again in (\d+(?:\.\d+)?)s",
+        r"retry after (\d+(?:\.\d+)?) seconds?",
+        r"wait (\d+(?:\.\d+)?) seconds?"
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, error_message.lower())
+        if match:
+            try:
+                # Convert to int, rounding up any decimal values
+                return int(float(match.group(1)) + 0.5)
+            except (ValueError, IndexError):
+                continue
+    
     return None
 
 
